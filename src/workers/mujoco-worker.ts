@@ -25,6 +25,10 @@ let stepCount = 0
 let initialized = false
 const pendingMessages: MessageEvent<WorkerRequest>[] = []
 
+// Rendering state — canvas is transferred once via the 'render' message
+let offscreenCanvas: OffscreenCanvas | null = null
+let canvasCtx: OffscreenCanvasRenderingContext2D | null = null
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -114,6 +118,125 @@ function doStep(actionArr: Float32Array): { obs: Float32Array; reward: number; d
   return { obs, reward, done }
 }
 
+// ─── Rendering ────────────────────────────────────────────────────────────────
+
+/**
+ * Draw a 2D side-view (X–Z plane) of the pendulum onto offscreenCanvas, then
+ * create an ImageBitmap and transfer it to the main thread.
+ *
+ * Bodies in this model (MuJoCo body indices):
+ *   0  worldbody  (static origin)
+ *   1  cart       (xpos[3..5])
+ *   2  pole       (body origin coincides with cart)
+ *   3  pole2      (body origin = top of pole1)
+ * Site 0: tip     (top of pole2)
+ *
+ * xpos layout: flat Float64Array, 3 values per body.
+ * site_xpos layout: flat Float64Array, 3 values per site.
+ */
+function renderFrame(): void {
+  if (!canvasCtx || !offscreenCanvas) return
+
+  const ctx = canvasCtx
+  const W = offscreenCanvas.width
+  const H = offscreenCanvas.height
+
+  // ── World→canvas coordinate transform ────────────────────────────────────
+  // z=0 (floor) maps to floorY; z increases upward so canvas y decreases.
+  const scale = H * 0.60     // pixels per metre  (288 px/m at H=480)
+  const floorY = H * 0.80    // y-pixel of world z=0
+  const originX = W * 0.50   // x-pixel of world x=0
+
+  const wx = (x: number) => originX + x * scale
+  const wy = (z: number) => floorY  - z * scale
+
+  // ── Clear ─────────────────────────────────────────────────────────────────
+  ctx.fillStyle = '#0f0f1e'
+  ctx.fillRect(0, 0, W, H)
+
+  // ── Floor line ────────────────────────────────────────────────────────────
+  ctx.strokeStyle = '#33334a'
+  ctx.lineWidth = 2
+  ctx.beginPath()
+  ctx.moveTo(0, wy(0))
+  ctx.lineTo(W, wy(0))
+  ctx.stroke()
+
+  // ── Rail (cart travel range) ───────────────────────────────────────────────
+  ctx.strokeStyle = '#22223a'
+  ctx.lineWidth = 4
+  ctx.beginPath()
+  ctx.moveTo(wx(-CART_RANGE), wy(0))
+  ctx.lineTo(wx(CART_RANGE),  wy(0))
+  ctx.stroke()
+
+  // ── Read world positions ───────────────────────────────────────────────────
+  const xpos    = asF64(data.xpos)      // 3 floats × nbody
+  const sitePos = asF64(data.site_xpos) // 3 floats × nsite
+
+  // Body 1: cart
+  const cartX = xpos[1 * 3 + 0]
+  const cartZ = xpos[1 * 3 + 2]
+
+  // Body 3: pole2 origin = top of pole1 = bottom of pole2
+  const midX = xpos[3 * 3 + 0]
+  const midZ = xpos[3 * 3 + 2]
+
+  // Site 0: tip = top of pole2
+  const tipX = sitePos[0]
+  const tipZ = sitePos[2]
+
+  // ── Pole 1 (cart→mid) ─────────────────────────────────────────────────────
+  ctx.strokeStyle = '#00cccc'
+  ctx.lineWidth = 8
+  ctx.lineCap = 'round'
+  ctx.beginPath()
+  ctx.moveTo(wx(cartX), wy(cartZ))
+  ctx.lineTo(wx(midX),  wy(midZ))
+  ctx.stroke()
+
+  // ── Pole 2 (mid→tip) ──────────────────────────────────────────────────────
+  ctx.strokeStyle = '#cc00cc'
+  ctx.lineWidth = 8
+  ctx.beginPath()
+  ctx.moveTo(wx(midX), wy(midZ))
+  ctx.lineTo(wx(tipX), wy(tipZ))
+  ctx.stroke()
+
+  // ── Cart body ─────────────────────────────────────────────────────────────
+  const cartPxW = 40
+  const cartPxH = 20
+  ctx.fillStyle = '#d4a017'
+  ctx.fillRect(
+    wx(cartX) - cartPxW / 2,
+    wy(cartZ) - cartPxH / 2,
+    cartPxW,
+    cartPxH,
+  )
+
+  // ── Joints ────────────────────────────────────────────────────────────────
+  ctx.fillStyle = '#ffffff'
+  ctx.beginPath()
+  ctx.arc(wx(cartX), wy(cartZ), 5, 0, Math.PI * 2)
+  ctx.fill()
+
+  ctx.beginPath()
+  ctx.arc(wx(midX), wy(midZ), 5, 0, Math.PI * 2)
+  ctx.fill()
+
+  // ── Tip marker ────────────────────────────────────────────────────────────
+  ctx.fillStyle = '#ff4444'
+  ctx.beginPath()
+  ctx.arc(wx(tipX), wy(tipZ), 5, 0, Math.PI * 2)
+  ctx.fill()
+
+  // ── Transfer bitmap to main thread ────────────────────────────────────────
+  createImageBitmap(offscreenCanvas).then(bitmap => {
+    const resp: WorkerResponse = { type: 'frame', bitmap }
+    self.postMessage(resp, [bitmap as unknown as Transferable])
+  })
+}
+
 // ─── Initialisation ───────────────────────────────────────────────────────────
 
 async function initMuJoCo(modelXML: string): Promise<void> {
@@ -141,6 +264,7 @@ function handleRequest(req: Exclude<WorkerRequest, { type: 'init' }>): void {
       const { obs, reward, done } = doStep(req.action)
       const resp: WorkerResponse = { type: 'step-result', obs, reward, done }
       self.postMessage(resp)
+      renderFrame() // fire-and-forget; step-result already sent above
       break
     }
 
@@ -148,11 +272,13 @@ function handleRequest(req: Exclude<WorkerRequest, { type: 'init' }>): void {
       const obs = doReset()
       const resp: WorkerResponse = { type: 'reset-result', obs }
       self.postMessage(resp)
+      renderFrame() // show the initial state after each reset
       break
     }
 
     case 'render': {
-      // Rendering wired up in a later phase
+      offscreenCanvas = req.canvas
+      canvasCtx = offscreenCanvas.getContext('2d')
       break
     }
 
